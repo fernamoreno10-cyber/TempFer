@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var batteryItem:   NSMenuItem!
     private var ssdItem:       NSMenuItem!
     private var allTempsItem:  NSMenuItem!
+    private var topProcsItem:  NSMenuItem!
     private var loginItem:     NSMenuItem!
     private var colorItem:     NSMenuItem!
 
@@ -48,6 +49,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(batteryItem)
         menu.addItem(ssdItem)
         menu.addItem(.separator())
+
+        topProcsItem = NSMenuItem(title: "Top procesos", action: nil, keyEquivalent: "")
+        topProcsItem.submenu = NSMenu()
+        menu.addItem(topProcsItem)
 
         allTempsItem = NSMenuItem(title: "Todos los sensores", action: nil, keyEquivalent: "")
         allTempsItem.submenu = NSMenu()
@@ -103,6 +108,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         batteryItem.title = "Batería: \(s.battery.map { format($0) } ?? "—")"
         ssdItem.title     = "SSD:     \(s.ssd.map { format($0) } ?? "—")"
 
+        // Top processes by CPU
+        let procMenu = NSMenu()
+        let procs = ProcessMonitor.topByCPU(limit: 6)
+        if procs.isEmpty {
+            let ni = NSMenuItem(title: "Sin datos", action: nil, keyEquivalent: "")
+            ni.isEnabled = false
+            procMenu.addItem(ni)
+        } else {
+            for p in procs {
+                let cpuStr = String(format: "%5.1f%%", p.cpu)
+                let memStr = p.mem >= 1024
+                    ? String(format: "%.1f GB", p.mem / 1024)
+                    : String(format: "%.0f MB", p.mem)
+                let item = NSMenuItem(
+                    title: "\(cpuStr) CPU  \(memStr) RAM   \(p.name)",
+                    action: nil, keyEquivalent: ""
+                )
+                item.isEnabled = false
+                // Color red if >30% CPU
+                if p.cpu > 30 {
+                    item.attributedTitle = NSAttributedString(
+                        string: item.title,
+                        attributes: [.foregroundColor: NSColor.systemRed]
+                    )
+                } else if p.cpu > 10 {
+                    item.attributedTitle = NSAttributedString(
+                        string: item.title,
+                        attributes: [.foregroundColor: NSColor.systemOrange]
+                    )
+                }
+                procMenu.addItem(item)
+            }
+        }
+        topProcsItem.submenu = procMenu
+
+        // All sensors
         let allMenu = NSMenu()
         for r in reader.readAll().sorted(by: { $0.celsius > $1.celsius }) {
             let item = NSMenuItem(title: "\(r.name):  \(format(r.celsius))", action: nil, keyEquivalent: "")
