@@ -1,177 +1,271 @@
 import Cocoa
 import ServiceManagement
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem!
-    private var menu: NSMenu!
-    private var reader: TempReader?
-    private var timer: Timer?
+// MARK: - Hover detector
 
-    private var cpuItem:       NSMenuItem!
-    private var batteryItem:   NSMenuItem!
-    private var ssdItem:       NSMenuItem!
-    private var allTempsItem:  NSMenuItem!
-    private var topProcsItem:  NSMenuItem!
-    private var loginItem:     NSMenuItem!
-    private var colorItem:     NSMenuItem!
+final class HoverView: NSView {
+    var onHover: ((Bool) -> Void)?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach { removeTrackingArea($0) }
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self, userInfo: nil
+        ))
+    }
+    override func mouseEntered(with event: NSEvent) { onHover?(true)  }
+    override func mouseExited(with event: NSEvent)  { onHover?(false) }
+}
+
+// MARK: - App Delegate
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+
+    private var statusItem: NSStatusItem!
+    private var popover:    NSPopover!
+    private var popoverVC:  PopoverViewController!
+    private var settingsWC: SettingsWindowController?
+
+    private var reader: TempReader?
+    private var updateTimer: Timer?
+    private var hoverTimer:  Timer?
+
+    private let launchDate = Date()
+    private var lastContextForAI: AIAdvisor.Context?
+
+    // MARK: - Launch
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        guard let r = TempReader.make() else {
+            showAlert("TempFer", "No se pudo acceder a los sensores térmicos.")
+            NSApp.terminate(nil)
+            return
+        }
+        reader = r
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+        setupPopover()
+        setupButton()
+        setupNotifications()
+
+        update()
+        scheduleUpdateTimer()
+    }
+
+    // MARK: - Popover
+
+    private func setupPopover() {
+        popoverVC = PopoverViewController()
+        popoverVC.onSettingsTap = { [weak self] in self?.openSettings() }
+
+        popover           = NSPopover()
+        popover.contentViewController = popoverVC
+        popover.behavior  = .semitransient
+        popover.animates  = false
+    }
+
+    // MARK: - Status bar button
+
+    private func setupButton() {
+        guard let btn = statusItem.button else { return }
+        btn.target = self
+        btn.action = #selector(buttonClicked(_:))
+        btn.sendAction(on: [.leftMouseUp, .rightMouseUp])
+
+        let hover = HoverView(frame: btn.bounds)
+        hover.autoresizingMask = [.width, .height]
+        btn.addSubview(hover)
+        hover.onHover = { [weak self] entering in
+            guard let self else { return }
+            if entering {
+                guard !self.popover.isShown else { return }
+                self.hoverTimer?.invalidate()
+                self.hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.22, repeats: false) { [weak self] _ in
+                    self?.showPopover()
+                }
+            } else {
+                self.hoverTimer?.invalidate()
+            }
+        }
+    }
+
+    @objc private func buttonClicked(_ sender: NSStatusBarButton) {
+        hoverTimer?.invalidate()
+        guard let event = NSApp.currentEvent else { return }
+        if event.type == .rightMouseUp {
+            statusItem.popUpMenu(buildContextMenu())
+        } else {
+            popover.isShown ? popover.close() : showPopover()
+        }
+    }
+
+    private func showPopover() {
+        guard let btn = statusItem.button else { return }
+        popover.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
+    }
+
+    // MARK: - Context menu (right-click)
+
+    private func buildContextMenu() -> NSMenu {
+        let m = NSMenu()
+
+        let prefsItem = NSMenuItem(title: "Preferencias…", action: #selector(openSettingsAction), keyEquivalent: ",")
+        prefsItem.target = self
+        m.addItem(prefsItem)
+
+        m.addItem(.separator())
+
+        let colorItem = NSMenuItem(
+            title: colorEnabled ? "✓ Color por temperatura" : "  Color por temperatura",
+            action: #selector(toggleColor), keyEquivalent: "c"
+        )
+        colorItem.target = self
+        m.addItem(colorItem)
+
+        let loginItem = NSMenuItem(
+            title: SMAppService.mainApp.status == .enabled ? "✓ Iniciar con el Mac" : "  Iniciar con el Mac",
+            action: #selector(toggleLogin), keyEquivalent: ""
+        )
+        loginItem.target = self
+        m.addItem(loginItem)
+
+        m.addItem(.separator())
+        m.addItem(NSMenuItem(title: "Salir", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        return m
+    }
+
+    // MARK: - Settings
+
+    @objc private func openSettingsAction() { openSettings() }
+
+    private func openSettings() {
+        popover.close()
+        if settingsWC == nil { settingsWC = SettingsWindowController() }
+        settingsWC?.show()
+    }
+
+    // MARK: - Update loop
+
+    private func scheduleUpdateTimer() {
+        updateTimer?.invalidate()
+        let interval = UserDefaults.standard.object(forKey: "refreshInterval") as? Double ?? 5
+        updateTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.update()
+        }
+    }
+
+    private func update() {
+        guard let reader else { return }
+        let s     = reader.summary()
+        let procs = ProcessMonitor.topByCPU(limit: 5)
+
+        updateStatusBar(cpu: s.cpu)
+        popoverVC.refresh(cpu: s.cpu, battery: s.battery, ssd: s.ssd, processes: procs)
+
+        let ctx = AIAdvisor.Context(
+            cpuTemp:      s.cpu,
+            batteryTemp:  s.battery,
+            ssdTemp:      s.ssd,
+            topProcesses: procs,
+            sessionMinutes: Int(Date().timeIntervalSince(launchDate) / 60)
+        )
+        lastContextForAI = ctx
+
+        // Update tip "next in X min" if a tip is already showing
+        if case .tip(let text, _) = popoverVC.tipView.state {
+            let next = nextTipString()
+            popoverVC.tipView.setState(.tip(text, next: next))
+        }
+
+        AIAdvisor.shared.checkScheduled(context: ctx)
+    }
+
+    private func updateStatusBar(cpu: Double) {
+        let tempStr = cpu > 0 ? " \(formatTemp(cpu))" : " —"
+        if colorEnabled && cpu > 0 {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: tempColor(cpu),
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            ]
+            statusItem.button?.attributedTitle = NSAttributedString(string: tempStr, attributes: attrs)
+        } else {
+            statusItem.button?.attributedTitle = NSAttributedString(string: "")
+            statusItem.button?.title = tempStr
+        }
+        statusItem.button?.image         = thermometerIcon(celsius: cpu)
+        statusItem.button?.imagePosition = .imageLeft
+    }
+
+    // MARK: - AI wiring
+
+    private func setupNotifications() {
+        AIAdvisor.shared.onLoadingStart = { [weak self] in
+            self?.popoverVC.tipView.setState(.loading)
+        }
+        AIAdvisor.shared.onTip = { [weak self] text in
+            guard let self else { return }
+            self.popoverVC.tipView.setState(.tip(text, next: self.nextTipString()))
+            (self.settingsWC?.contentViewController as? SettingsViewController)?.tipGenerated()
+        }
+
+        NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged),
+                                               name: .tempferSettingsChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(testAIRequested),
+                                               name: .tempferTestAI, object: nil)
+
+        // Request notification permission
+        AIAdvisor.shared.requestNotificationPermission()
+
+        // Set initial tip state
+        if AIAdvisor.shared.apiKey.isEmpty {
+            popoverVC.tipView.setState(.noKey)
+        }
+    }
+
+    @objc private func settingsChanged() {
+        scheduleUpdateTimer()
+        update()
+    }
+
+    @objc private func testAIRequested() {
+        guard let ctx = lastContextForAI else { return }
+        AIAdvisor.shared.generateNow(context: ctx)
+    }
+
+    private func nextTipString() -> String {
+        guard AIAdvisor.shared.scheduledTipsActive else { return "manual" }
+        let mins = AIAdvisor.shared.minutesUntilNextTip
+        if mins <= 0 { return "pronto" }
+        if mins < 60 { return "\(mins) min" }
+        let h = mins / 60, m = mins % 60
+        return m > 0 ? "\(h)h \(m)min" : "\(h)h"
+    }
+
+    // MARK: - Menu actions
 
     private var colorEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "colorEnabled") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "colorEnabled") }
     }
 
-    func applicationDidFinishLaunching(_ note: Notification) {
-        guard let r = TempReader.make() else {
-            NSAlert.show("TempFer", "No se pudo acceder a los sensores.")
-            NSApp.terminate(nil)
-            return
-        }
-        reader = r
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        buildMenu()
+    @objc private func toggleColor() {
+        colorEnabled = !colorEnabled
         update()
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.update()
+    }
+
+    @objc private func toggleLogin() {
+        let svc = SMAppService.mainApp
+        do {
+            if svc.status == .enabled { try svc.unregister() } else { try svc.register() }
+        } catch {
+            showAlert("TempFer", "Error: \(error.localizedDescription)")
         }
     }
 
-    private func buildMenu() {
-        menu = NSMenu()
-
-        cpuItem     = NSMenuItem(title: "CPU: —", action: nil, keyEquivalent: "")
-        batteryItem = NSMenuItem(title: "Batería: —", action: nil, keyEquivalent: "")
-        ssdItem     = NSMenuItem(title: "SSD: —", action: nil, keyEquivalent: "")
-        cpuItem.isEnabled     = false
-        batteryItem.isEnabled = false
-        ssdItem.isEnabled     = false
-
-        menu.addItem(cpuItem)
-        menu.addItem(batteryItem)
-        menu.addItem(ssdItem)
-        menu.addItem(.separator())
-
-        topProcsItem = NSMenuItem(title: "Top procesos", action: nil, keyEquivalent: "")
-        topProcsItem.submenu = NSMenu()
-        menu.addItem(topProcsItem)
-
-        allTempsItem = NSMenuItem(title: "Todos los sensores", action: nil, keyEquivalent: "")
-        allTempsItem.submenu = NSMenu()
-        menu.addItem(allTempsItem)
-        menu.addItem(.separator())
-
-        colorItem = NSMenuItem(
-            title: colorItemTitle(),
-            action: #selector(toggleColor),
-            keyEquivalent: "c"
-        )
-        colorItem.target = self
-        menu.addItem(colorItem)
-
-        loginItem = NSMenuItem(
-            title: loginItemTitle(),
-            action: #selector(toggleLoginItem),
-            keyEquivalent: ""
-        )
-        loginItem.target = self
-        menu.addItem(loginItem)
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Salir", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-
-        statusItem.menu = menu
-    }
-
-    // MARK: - Update
-
-    private func update() {
-        guard let reader else { return }
-        let s = reader.summary()
-
-        if s.cpu > 0 {
-            let tempStr = " \(String(format: "%.0f°", s.cpu))"
-            if colorEnabled {
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .foregroundColor: tempColor(s.cpu),
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-                ]
-                statusItem.button?.attributedTitle = NSAttributedString(string: tempStr, attributes: attrs)
-            } else {
-                statusItem.button?.attributedTitle = NSAttributedString(string: "")
-                statusItem.button?.title = tempStr
-            }
-        } else {
-            statusItem.button?.title = " —"
-        }
-        statusItem.button?.image = thermometerIcon(celsius: s.cpu)
-        statusItem.button?.imagePosition = .imageLeft
-
-        cpuItem.title     = "CPU:     \(format(s.cpu))   \(tempLabel(s.cpu))"
-        batteryItem.title = "Batería: \(s.battery.map { format($0) } ?? "—")"
-        ssdItem.title     = "SSD:     \(s.ssd.map { format($0) } ?? "—")"
-
-        // Top processes by CPU
-        let procMenu = NSMenu()
-        let procs = ProcessMonitor.topByCPU(limit: 6)
-        if procs.isEmpty {
-            let ni = NSMenuItem(title: "Sin datos", action: nil, keyEquivalent: "")
-            ni.isEnabled = false
-            procMenu.addItem(ni)
-        } else {
-            for p in procs {
-                let cpuStr = String(format: "%5.1f%%", p.cpu)
-                let memStr = p.mem >= 1024
-                    ? String(format: "%.1f GB", p.mem / 1024)
-                    : String(format: "%.0f MB", p.mem)
-                let item = NSMenuItem(
-                    title: "\(cpuStr) CPU  \(memStr) RAM   \(p.name)",
-                    action: nil, keyEquivalent: ""
-                )
-                item.isEnabled = false
-                // Color red if >30% CPU
-                if p.cpu > 30 {
-                    item.attributedTitle = NSAttributedString(
-                        string: item.title,
-                        attributes: [.foregroundColor: NSColor.systemRed]
-                    )
-                } else if p.cpu > 10 {
-                    item.attributedTitle = NSAttributedString(
-                        string: item.title,
-                        attributes: [.foregroundColor: NSColor.systemOrange]
-                    )
-                }
-                procMenu.addItem(item)
-            }
-        }
-        topProcsItem.submenu = procMenu
-
-        // All sensors
-        let allMenu = NSMenu()
-        for r in reader.readAll().sorted(by: { $0.celsius > $1.celsius }) {
-            let item = NSMenuItem(title: "\(r.name):  \(format(r.celsius))", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            allMenu.addItem(item)
-        }
-        allTempsItem.submenu = allMenu
-    }
-
-    // MARK: - Temperature helpers
-
-    private func tempColor(_ c: Double) -> NSColor {
-        switch c {
-        case ..<50:  return NSColor(red: 0.20, green: 0.78, blue: 0.35, alpha: 1) // green
-        case ..<70:  return NSColor(red: 1.00, green: 0.80, blue: 0.00, alpha: 1) // yellow
-        case ..<85:  return NSColor(red: 1.00, green: 0.50, blue: 0.00, alpha: 1) // orange
-        default:     return NSColor(red: 1.00, green: 0.23, blue: 0.19, alpha: 1) // red
-        }
-    }
-
-    private func tempLabel(_ c: Double) -> String {
-        switch c {
-        case ..<50:  return "✦ Óptima"
-        case ..<70:  return "◆ Normal"
-        case ..<85:  return "▲ Alta"
-        default:     return "⚠ Crítica"
-        }
-    }
+    // MARK: - Helpers
 
     private func thermometerIcon(celsius: Double) -> NSImage? {
         let name: String
@@ -185,48 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return img
     }
 
-    private func format(_ c: Double) -> String { String(format: "%.1f°C", c) }
-
-    // MARK: - Color toggle
-
-    @objc private func toggleColor() {
-        colorEnabled = !colorEnabled
-        colorItem.title = colorItemTitle()
-        update()
-    }
-
-    private func colorItemTitle() -> String {
-        colorEnabled ? "✓ Color por temperatura" : "  Color por temperatura"
-    }
-
-    // MARK: - Login item
-
-    @objc private func toggleLoginItem() {
-        let svc = SMAppService.mainApp
-        do {
-            if svc.status == .enabled {
-                try svc.unregister()
-            } else {
-                try svc.register()
-            }
-        } catch {
-            NSAlert.show("TempFer", "Error al cambiar inicio automático: \(error.localizedDescription)")
-        }
-        loginItem.title = loginItemTitle()
-    }
-
-    private func loginItemTitle() -> String {
-        SMAppService.mainApp.status == .enabled
-            ? "✓ Iniciar con el Mac"
-            : "  Iniciar con el Mac"
-    }
-}
-
-private extension NSAlert {
-    static func show(_ title: String, _ msg: String) {
-        let a = NSAlert()
-        a.messageText = title
-        a.informativeText = msg
-        a.runModal()
+    private func showAlert(_ title: String, _ msg: String) {
+        let a = NSAlert(); a.messageText = title; a.informativeText = msg; a.runModal()
     }
 }
